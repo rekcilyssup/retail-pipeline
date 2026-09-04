@@ -1,0 +1,9 @@
+pyspark==3.5.1
+kafka-python-ng>=2.2.0
+faker==22.0.0
+psycopg2-binary==2.9.9
+pandas==2.1.4
+pyarrow>=14.0.0
+pymongo==4.6.1
+elasticsearch==8.11.1
+

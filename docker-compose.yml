@@ -1,0 +1,70 @@
+version: "3.8"
+
+services:
+  # ---- Source RDBMS (OLTP Database) ----
+  postgres:
+    image: postgres:15
+    container_name: rp-postgres
+    environment:
+      POSTGRES_USER: retail
+      POSTGRES_PASSWORD: retail
+      POSTGRES_DB: retail_src
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retail"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---- Streaming backbone ----
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rp-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rp-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  # ---- NoSQL sink for processed/aggregated results ----
+  mongodb:
+    image: mongo:7
+    container_name: rp-mongo
+    ports:
+      - "27017:27017"
+
+  # ---- ELK for log monitoring / exception tracking ----
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+    container_name: rp-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.1
+    container_name: rp-kibana
+    depends_on:
+      - elasticsearch
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"

@@ -1,0 +1,12 @@
+data/lake/*
+!data/lake/.gitkeep
+data/checkpoints/
+data/dead_letter/*
+!data/dead_letter/.gitkeep
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
