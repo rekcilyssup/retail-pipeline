@@ -74,14 +74,48 @@ assert n == len(ids), "FAIL: duplicate order rows in the sink"
 print("OK: sink is idempotent (one document per order_id)")
 EOF
     ;;
-  *)
-    echo "usage: $0 {up|topics|batch|stream|produce|verify}"
+  test)
+    "$PY" tests/test_validation.py
+    ;;
+  airflow)
+    shift || true
+    docker compose --profile airflow up -d
+    sleep 20
+    docker exec rp-airflow-scheduler airflow dags unpause retail_customer_dimension
+    docker exec rp-airflow-scheduler airflow dags list-import-errors
+    docker exec rp-airflow-scheduler airflow dags trigger retail_customer_dimension "$@"
     echo
-    echo "  up       start postgres/kafka/mongo/elasticsearch/kibana"
-    echo "  topics   create orders_stream + orders_stream_dlt (3 partitions each)"
-    echo "  batch    extract customer dimension -> Parquet lake"
-    echo "  stream   run the Spark Structured Streaming consumer (blocking)"
-    echo "  produce  emit 200 CDC events into Kafka"
-    echo "  verify   assert the Mongo sink has no duplicate order rows"
+    echo "DAG state:"
+    docker exec rp-airflow-scheduler airflow dags list-runs -d retail_customer_dimension | head -6
+    echo
+    echo "Task states:"
+    RUN=$(docker exec rp-airflow-scheduler airflow dags list-runs -d retail_customer_dimension \
+          --output json 2>/dev/null | "$PY" -c "
+import sys, json
+runs = json.load(sys.stdin)
+runs.sort(key=lambda r: r['start_date'], reverse=True)
+print(runs[0]['run_id'])")
+    docker exec rp-airflow-scheduler airflow tasks states-for-dag-run retail_customer_dimension "$RUN"
+    ;;
+  test-airflow)
+    "$PY" tests/test_validation.py
+    echo
+    echo "DAG import errors:"
+    docker exec rp-airflow-scheduler airflow dags list-import-errors
+    echo "Registered DAGs:"
+    docker exec rp-airflow-scheduler airflow dags list 2>/dev/null | grep -E "dag_id|retail_" || true
+    ;;
+  *)
+    echo "usage: $0 {up|topics|batch|stream|produce|verify|test|airflow|test-airflow}"
+    echo
+    echo "  up           start postgres/kafka/mongo/elasticsearch/kibana"
+    echo "  topics       create orders_stream + orders_stream_dlt (3 partitions each)"
+    echo "  batch        extract, validate and publish the customer dimension"
+    echo "  stream       run the Spark Structured Streaming consumer (blocking)"
+    echo "  produce      emit 200 CDC events into Kafka"
+    echo "  verify       assert the Mongo sink has no duplicate order rows"
+    echo "  test         run the data quality gate unit tests"
+    echo "  airflow      start Airflow and trigger the batch DAG (opt-in profile)"
+    echo "  test-airflow check the DAG parses with no import errors"
     ;;
 esac

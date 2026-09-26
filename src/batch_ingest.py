@@ -24,7 +24,12 @@ PG_CONN = dict(
     password=os.getenv("PG_PASSWORD", "retail"),
     connect_timeout=10,
 )
-OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data", "lake", "customers.parquet")
+LAKE_DIR = os.path.join(PROJECT_ROOT, "data", "lake")
+# The candidate path is separate from the published path on purpose: a run that
+# fails validation must not overwrite the last known-good snapshot that the
+# streaming job is reading from.
+CANDIDATE_PATH = os.path.join(LAKE_DIR, "_candidate", "customers.parquet")
+PUBLISHED_PATH = os.path.join(LAKE_DIR, "customers.parquet")
 
 
 def normalise_for_spark(df: pd.DataFrame) -> pd.DataFrame:
@@ -48,8 +53,7 @@ def normalise_for_spark(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def extract_customers() -> pd.DataFrame:
-    logger.info(f"Connecting to source Postgres at {PG_CONN['host']}:{PG_CONN['port']}/{PG_CONN['dbname']}")
+def _engine():
     url = URL.create(
         drivername="postgresql+psycopg2",
         username=PG_CONN["user"],
@@ -58,7 +62,31 @@ def extract_customers() -> pd.DataFrame:
         port=PG_CONN["port"],
         database=PG_CONN["dbname"],
     )
-    engine = create_engine(url, connect_args={"connect_timeout": PG_CONN["connect_timeout"]})
+    return create_engine(url, connect_args={"connect_timeout": PG_CONN["connect_timeout"]})
+
+
+def fetch_source_metadata() -> dict:
+    """
+    Row count and high-water mark straight from the source.
+
+    These are the reconciliation baselines: a lake that silently drops or
+    duplicates rows still exists and still looks plausible, so the only way to
+    notice is to compare against the source.
+    """
+    engine = _engine()
+    try:
+        with engine.connect() as conn:
+            row = conn.exec_driver_sql(
+                "SELECT COUNT(*) AS row_count, MAX(updated_at) AS max_updated_at FROM customers"
+            ).fetchone()
+    finally:
+        engine.dispose()
+    return {"row_count": int(row[0]), "max_updated_at": row[1]}
+
+
+def extract_customers() -> pd.DataFrame:
+    logger.info(f"Connecting to source Postgres at {PG_CONN['host']}:{PG_CONN['port']}/{PG_CONN['dbname']}")
+    engine = _engine()
     try:
         with engine.connect() as conn:
             df = pd.read_sql("SELECT * FROM customers", conn)
@@ -71,17 +99,19 @@ def extract_customers() -> pd.DataFrame:
     return df
 
 
-def load_to_lake(df: pd.DataFrame):
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    try:
-        df.to_parquet(OUTPUT_PATH, index=False)
-        logger.info(f"Wrote {len(df)} rows to {OUTPUT_PATH}")
-    except Exception as e:
-        logger.error(f"Failed writing to data lake: {e}", exc_info=True)
-        raise
+def load_to_candidate(df: pd.DataFrame) -> str:
+    """Write the extracted snapshot to the staging area, not to the live path."""
+    os.makedirs(os.path.dirname(CANDIDATE_PATH), exist_ok=True)
+    df.to_parquet(CANDIDATE_PATH, index=False)
+    logger.info(f"Wrote {len(df)} candidate rows to {CANDIDATE_PATH}")
+    return CANDIDATE_PATH
 
 
 if __name__ == "__main__":
-    df = extract_customers()
-    load_to_lake(df)
-    logger.info("Batch ingestion complete")
+    try:
+        df = extract_customers()
+        load_to_candidate(df)
+        logger.info("Batch extraction complete -- candidate ready for validation")
+    except Exception as e:
+        logger.error(f"Batch extraction failed: {e}", exc_info=True)
+        raise

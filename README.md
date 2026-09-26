@@ -50,13 +50,17 @@ The pipeline handles three data flows:
 - **Micro-Batch Processing with Checkpointing**: `checkpointLocation` gives at-least-once recovery. A write failure is never swallowed - the query fails so the batch is replayed, which is the only safe behaviour once a checkpoint exists.
 - **Backpressure Control**: `maxOffsetsPerTrigger` bounds how much is read per micro-batch, and consumer lag is logged per partition with a warning threshold.
 - **Reconciling Observability**: Per-batch counters (invalid / late / superseded / stale / upserted / deleted) sum back to the events processed, with an explicit `reconciles=` flag. Structured logs ship to Elasticsearch for Kibana, and degrade to local rotating files if the cluster is unreachable.
-- **Boundary Type Safety**: The batch job normalises pandas' nanosecond timestamps to microseconds before writing Parquet, because Spark 3.5 rejects unflagged `INT64 (TIMESTAMP(NANOS))`. The dimension is projected to the attributes the stream needs, since BSON cannot represent Spark's `TimestampNTZ`.
+- **Data Quality Gate**: Thirteen checks across completeness, uniqueness, validity, consistency and freshness run between extraction and publication. A breach quarantines the candidate snapshot, fails the run, and leaves the last known-good dimension in place. Unit tested so every check is proven to fire.
+- **Boundary Type Safety**: The batch job normalises pandas' nanosecond timestamps to microseconds before writing Parquet, because Spark 3.5 rejects unflagged `INT64 (TIMESTAMP(NANOS))`. The dimension is projected to the attributes the stream needs, since BSON cannot represent Spark's `TimestampNTZ`. Schema scratch columns no longer reach the sink.
 - **Polyglot Storage**: Columnar Parquet for batch analytics, document storage in MongoDB for low-latency operational reads.
-- **Workflow Orchestration**: `scripts/run.sh` sequences the stages with retries and exit-code checks.
+- **Workflow Orchestration**: An Airflow DAG (`extract → validate → publish`) with real task dependencies, plus `scripts/run.sh` as the local entrypoint. Stages raise rather than return `False`, because an Airflow `PythonOperator` treats any non-exception return as success.
 
-> **Not yet wired up:** `airflow_dag.py` is included as an Airflow 2.x reference DAG but is
-> **not** started by `docker-compose.yml` and has not been executed end to end. Treat it as
-> a design sketch, not a working component.
+> **Airflow is opt-in.** The DAG runs under a compose profile so its large image is not
+> resident by default:
+> ```bash
+> ./scripts/run.sh airflow          # start Airflow and trigger the batch DAG
+> ./scripts/run.sh test-airflow     # validation tests + DAG import check
+> ```
 
 ---
 
@@ -76,23 +80,27 @@ The pipeline handles three data flows:
 ## Repository Structure
 
 ```
-├── airflow_dag.py             # Airflow 2.x reference DAG (not started by compose)
-├── docker-compose.yml         # Multi-service stack (Postgres, Kafka, Mongo, ES, Kibana)
+├── airflow_dag.py             # Airflow 2.x DAG: extract -> validate -> publish
+├── docker-compose.yml         # Multi-service stack + opt-in `airflow` profile
 ├── requirements.txt           # Python dependencies (PySpark, Kafka, PyArrow, SQLAlchemy, etc.)
 ├── .env.example               # Host port overrides, for running beside other projects
-├── scripts/
-│   └── run.sh                 # Single entrypoint: up / topics / batch / stream / produce / verify
 ├── data/
-│   ├── init_postgres.sql      # Seed script for OLTP database
-│   ├── lake/                  # Parquet data lake destination (customer dimension)
+│   ├── init_postgres.sql      # Seed script for the OLTP database
+│   ├── init_airflow.sql       # Airflow metadata database, separate from retail_src
+│   ├── lake/                  # _candidate/ (staging) and customers.parquet (published)
 │   ├── checkpoints/           # Spark Structured Streaming offsets + WAL
-│   └── dead_letter/           # Unused: dead-letter records go to the orders_stream_dlt topic
+│   └── rejected/              # Snapshots quarantined by the quality gate
 ├── logs/                      # Rotating application logs
+├── scripts/
+│   └── run.sh                 # Single entrypoint: up/topics/batch/stream/produce/verify/test/airflow
+├── tests/
+│   └── test_validation.py     # Asserts every quality check fires on bad data
 └── src/
-    ├── batch_ingest.py        # JDBC batch extraction to Parquet lake, with Spark-safe dtypes
+    ├── validation.py          # 13-check data quality gate
+    ├── batch_ingest.py        # JDBC extraction to a candidate Parquet snapshot
     ├── producer.py            # Kafka CDC event simulator (I/U/D, lsn, chaos injection)
-    ├── spark_pipeline.py      # Spark Structured Streaming engine, CDC apply, LSN guard, DLT
-    ├── run_pipeline.py        # Batch coordinator with retries and output validation
+    ├── spark_pipeline.py      # Streaming engine: CDC apply, LSN guard, dead-letter topic
+    ├── run_pipeline.py        # extract/validate/publish stages shared by CLI and Airflow
     └── utils/
         └── es_logger.py       # Distributed log forwarder for Elasticsearch
 ```
@@ -136,10 +144,12 @@ Everything is wrapped by `scripts/run.sh`, which sets the interpreter and env co
 ```bash
 ./scripts/run.sh up       # postgres, kafka, mongo, elasticsearch, kibana
 ./scripts/run.sh topics   # orders_stream + orders_stream_dlt, 3 partitions each
-./scripts/run.sh batch    # extract customer dimension -> Parquet lake
+./scripts/run.sh batch    # extract -> validate (13 checks) -> publish
 ./scripts/run.sh stream   # Spark Structured Streaming consumer (blocking, run in its own terminal)
 ./scripts/run.sh produce  # emit 200 CDC events into Kafka (own terminal)
-./scripts/run.sh verify   # assert the sink has exactly one document per order_id
+./scripts/run.sh verify   # assert the sink holds exactly one document per order_id
+./scripts/run.sh test     # data quality gate unit tests
+./scripts/run.sh airflow  # opt-in: start Airflow and trigger the batch DAG
 ```
 
 <details>

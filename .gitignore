@@ -1,8 +1,8 @@
 data/lake/*
 !data/lake/.gitkeep
 data/checkpoints/
-data/dead_letter/*
-!data/dead_letter/.gitkeep
+data/rejected/
+data/dead_letter/
 logs/*
 !logs/.gitkeep
 __pycache__/
@@ -10,4 +10,3 @@ __pycache__/
 .venv/
 .env
 .DS_Store
-

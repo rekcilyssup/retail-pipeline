@@ -15,7 +15,8 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - ./data/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./data/init_postgres.sql:/docker-entrypoint-initdb.d/01_init_postgres.sql
+      - ./data/init_airflow.sql:/docker-entrypoint-initdb.d/02_init_airflow.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U retail"]
       interval: 5s
@@ -91,3 +92,59 @@ services:
       ELASTICSEARCH_HOSTS: http://elasticsearch:9200
     ports:
       - "${KIBANA_PORT:-5601}:5601"
+
+  # ---- Orchestration (opt-in: docker compose --profile airflow up -d) ----
+  # Kept behind a profile because the Airflow image is large and this machine
+  # already runs five other services. The DAG in airflow_dag.py is not required
+  # for the streaming pipeline; scripts/run.sh is the default entrypoint.
+  airflow-init:
+    image: apache/airflow:2.9.3
+    container_name: rp-airflow-init
+    profiles: ["airflow"]
+    user: "50000:0"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project
+      AIRFLOW__CORE__EXECUTOR_MIN_PARALLELISM: "1"
+      AIRFLOW__CORE__EXECUTOR_MAX_PARALLELISM: "2"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      RETAIL_PIPELINE_SRC: /opt/airflow/project/src
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: retail_src
+      PG_USER: retail
+      PG_PASSWORD: retail
+      ES_HOST: http://elasticsearch:9200
+    volumes:
+      - ./:/opt/airflow/project
+    command: ["bash", "-c", "airflow db migrate && airflow users create --username admin --password admin --firstname Data --lastname Platform --role Admin --email admin@example.com || true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.3
+    container_name: rp-airflow-scheduler
+    profiles: ["airflow"]
+    user: "50000:0"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project
+      AIRFLOW__CORE__EXECUTOR_MIN_PARALLELISM: "1"
+      AIRFLOW__CORE__EXECUTOR_MAX_PARALLELISM: "2"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      RETAIL_PIPELINE_SRC: /opt/airflow/project/src
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: retail_src
+      PG_USER: retail
+      PG_PASSWORD: retail
+      ES_HOST: http://elasticsearch:9200
+    volumes:
+      - ./:/opt/airflow/project
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
