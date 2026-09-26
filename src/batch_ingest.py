@@ -7,6 +7,8 @@ import os
 import sys
 import psycopg2
 import pandas as pd
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 
 sys.path.append(os.path.dirname(__file__))
 from utils.es_logger import get_logger
@@ -14,20 +16,59 @@ from utils.es_logger import get_logger
 logger = get_logger("batch_ingest")
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-PG_CONN = dict(host="localhost", port=5432, dbname="retail_src", user="retail", password="retail")
+PG_CONN = dict(
+    host=os.getenv("PG_HOST", "localhost"),
+    port=int(os.getenv("PG_PORT", "5432")),
+    dbname=os.getenv("PG_DB", "retail_src"),
+    user=os.getenv("PG_USER", "retail"),
+    password=os.getenv("PG_PASSWORD", "retail"),
+    connect_timeout=10,
+)
 OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data", "lake", "customers.parquet")
 
 
+def normalise_for_spark(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Coerce dtypes to the subset Spark can read.
+
+    pandas 2.x defaults to datetime64[ns], which pyarrow writes as a bare INT64
+    with an unflagged nanosecond timestamp. Spark refuses that
+    ("Illegal Parquet type: INT64 (TIMESTAMP(NANOS,false))") because it cannot
+    infer the resolution. Microsecond timestamps are written with a proper
+    converted type and are portable.
+    """
+    import datetime as dt
+
+    for column in df.columns:
+        series = df[column]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            df[column] = series.astype("datetime64[us]")
+        elif series.dtype == object and len(series) and isinstance(series.dropna().iloc[0], dt.date):
+            df[column] = pd.to_datetime(series).astype("datetime64[us]")
+    return df
+
+
 def extract_customers() -> pd.DataFrame:
-    logger.info("Connecting to source Postgres to extract customers table")
+    logger.info(f"Connecting to source Postgres at {PG_CONN['host']}:{PG_CONN['port']}/{PG_CONN['dbname']}")
+    url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=PG_CONN["user"],
+        password=PG_CONN["password"],
+        host=PG_CONN["host"],
+        port=PG_CONN["port"],
+        database=PG_CONN["dbname"],
+    )
+    engine = create_engine(url, connect_args={"connect_timeout": PG_CONN["connect_timeout"]})
     try:
-        with psycopg2.connect(**PG_CONN) as conn:
+        with engine.connect() as conn:
             df = pd.read_sql("SELECT * FROM customers", conn)
-        logger.info(f"Extracted {len(df)} rows from customers")
-        return df
-    except Exception as e:
-        logger.error(f"Batch extraction failed: {e}", exc_info=True)
-        raise
+    finally:
+        engine.dispose()
+
+    logger.info(f"Extracted {len(df)} rows from customers")
+    df = normalise_for_spark(df)
+    logger.info(f"Normalised dtypes for Spark: {dict(df.dtypes.astype(str))}")
+    return df
 
 
 def load_to_lake(df: pd.DataFrame):
